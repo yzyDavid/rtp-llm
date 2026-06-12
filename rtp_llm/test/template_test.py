@@ -16,6 +16,9 @@ from rtp_llm.frontend.tokenizer_factory.tokenizers import (
     QWenTokenizer,
     QWenV2Tokenizer,
 )
+from rtp_llm.frontend.tokenizer_factory.tokenizers.qwen_tokenizer import (
+    _QWEN35_DEFAULT_CHAT_TEMPLATE,
+)
 from rtp_llm.openai.api_datatype import (
     ChatCompletionRequest,
     ChatMessage,
@@ -24,6 +27,7 @@ from rtp_llm.openai.api_datatype import (
     RoleEnum,
 )
 from rtp_llm.openai.renderer_factory import ChatRendererFactory, RendererParams
+from rtp_llm.openai.renderer_factory_register import _renderer_factory
 from rtp_llm.openai.renderers.qwen35_renderer import Qwen35Renderer
 from rtp_llm.openai.renderers.qwen_agent_renderer import QwenAgentRenderer
 from rtp_llm.openai.renderers.qwen_agent_tool_renderer import QwenAgentToolRenderer
@@ -51,6 +55,26 @@ class _Qwen35ItemsTemplateTokenizer:
 
     def decode(self, token_ids):
         return ""
+
+
+class _Qwen35DefaultTemplateTokenizer:
+    path = ""
+    chat_template = _QWEN35_DEFAULT_CHAT_TEMPLATE
+
+    def apply_chat_template(self, messages, **kwargs):
+        env = Environment()
+        env.globals["raise_exception"] = self._raise_exception
+        template = env.from_string(self.chat_template)
+        return template.render(messages=messages, **kwargs)
+
+    def encode(self, prompt):
+        return list(range(len(prompt)))
+
+    def decode(self, token_ids):
+        return ""
+
+    def _raise_exception(self, message):
+        raise ValueError(message)
 
 
 class BaseRendererTestMixin(ABC):
@@ -308,6 +332,34 @@ class TemplateTest(TestCase):
 
         assert (
             rendered_prompt == "get_current_temperature:location=San Francisco, CA, USA"
+        )
+
+    def test_qwen35_moe_mtp_uses_qwen35_renderer(self):
+        assert _renderer_factory["qwen35_moe_mtp"] is Qwen35Renderer
+
+    def test_qwen35_passes_chat_template_kwargs_to_template(self):
+        tokenizer = _Qwen35DefaultTemplateTokenizer()
+        renderer = Qwen35Renderer(
+            tokenizer,
+            RendererParams(
+                model_type="qwen35_dense",
+                max_seq_len=1024,
+                eos_token_id=0,
+                stop_word_ids_list=[],
+            ),
+            GenerateEnvConfig(),
+            RenderConfig(),
+        )
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="hello")],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        rendered_prompt = renderer.render_chat(request).rendered_prompt
+
+        assert rendered_prompt == (
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         )
 
     def test_qwen_agent(self):
