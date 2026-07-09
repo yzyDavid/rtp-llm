@@ -1,8 +1,16 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_runner.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
@@ -10,6 +18,183 @@
 using namespace torch_ext;
 
 namespace rtp_llm {
+
+namespace {
+
+bool envFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::string(value) != "0" && std::string(value) != "false"
+           && std::string(value) != "False";
+}
+
+int64_t envIntValue(const char* name, int64_t default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    char*   end    = nullptr;
+    int64_t parsed = std::strtoll(value, &end, 10);
+    return end == value ? default_value : parsed;
+}
+
+std::string envStringValue(const char* name, const char* default_value) {
+    const char* value = std::getenv(name);
+    return value == nullptr || value[0] == '\0' ? std::string(default_value) : std::string(value);
+}
+
+int64_t clampIndex(int64_t value, int64_t min_value, int64_t max_value) {
+    return std::max<int64_t>(min_value, std::min<int64_t>(value, max_value));
+}
+
+int64_t countHostI32NonZero(const torch::Tensor& tensor, int64_t begin, int64_t end) {
+    if (!tensor.defined() || tensor.is_cuda() || tensor.scalar_type() != torch::kInt32 || tensor.dim() != 1) {
+        return -1;
+    }
+    begin       = clampIndex(begin, 0, tensor.size(0));
+    end         = clampIndex(end, begin, tensor.size(0));
+    auto* data  = tensor.data_ptr<int32_t>();
+    int64_t cnt = 0;
+    for (int64_t i = begin; i < end; ++i) {
+        cnt += data[i] != 0;
+    }
+    return cnt;
+}
+
+int64_t countHostI32NotEqual(const torch::Tensor& tensor, int64_t begin, int64_t end, int32_t expected) {
+    if (!tensor.defined() || tensor.is_cuda() || tensor.scalar_type() != torch::kInt32 || tensor.dim() != 1) {
+        return -1;
+    }
+    begin       = clampIndex(begin, 0, tensor.size(0));
+    end         = clampIndex(end, begin, tensor.size(0));
+    auto* data  = tensor.data_ptr<int32_t>();
+    int64_t cnt = 0;
+    for (int64_t i = begin; i < end; ++i) {
+        cnt += data[i] != expected;
+    }
+    return cnt;
+}
+
+int64_t countDeviceI32NonZeroIfEnabled(const torch::Tensor& tensor, int64_t begin, int64_t end, bool enabled) {
+    if (!enabled || !tensor.defined() || !tensor.is_cuda() || tensor.scalar_type() != torch::kInt32
+        || tensor.dim() != 1) {
+        return -1;
+    }
+    begin = clampIndex(begin, 0, tensor.size(0));
+    end   = clampIndex(end, begin, tensor.size(0));
+    if (begin == end) {
+        return 0;
+    }
+    auto host = tensor.slice(0, begin, end).cpu();
+    return countHostI32NonZero(host, 0, host.size(0));
+}
+
+std::string hostI32PrefixJson(const torch::Tensor& tensor, int64_t limit) {
+    std::ostringstream os;
+    os << "[";
+    if (tensor.defined() && !tensor.is_cuda() && tensor.scalar_type() == torch::kInt32 && tensor.dim() == 1) {
+        limit      = clampIndex(limit, 0, tensor.size(0));
+        auto* data = tensor.data_ptr<int32_t>();
+        for (int64_t i = 0; i < limit; ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << data[i];
+        }
+    }
+    os << "]";
+    return os.str();
+}
+
+std::string hybridGroupTailJson(const PyAttentionInputs& attn_inputs,
+                                int64_t                  current_bs,
+                                int64_t                  graph_bs,
+                                int32_t                  full_group_id) {
+    std::ostringstream os;
+    os << "[";
+    const auto& groups = attn_inputs.kv_cache_kernel_block_id_host_by_group;
+    for (size_t g = 0; g < groups.size(); ++g) {
+        const auto& tensor   = groups[g];
+        int32_t     expected = full_group_id >= 0 && static_cast<int32_t>(g) != full_group_id ? -1 : 0;
+        int64_t     bad      = -1;
+        int32_t     first    = 0;
+        if (tensor.defined() && !tensor.is_cuda() && tensor.scalar_type() == torch::kInt32 && tensor.dim() == 2
+            && tensor.size(0) >= graph_bs && tensor.size(1) > 0) {
+            auto* data = tensor.data_ptr<int32_t>();
+            auto  cols = tensor.size(1);
+            bad        = 0;
+            for (int64_t row = current_bs; row < graph_bs; ++row) {
+                const int32_t value = data[row * cols];
+                if (row == current_bs) {
+                    first = value;
+                }
+                bad += value != expected;
+            }
+        }
+        if (g > 0) {
+            os << ",";
+        }
+        os << "{\"group\":" << g << ",\"expected_first_col\":" << expected << ",\"tail_bad_first_col\":" << bad
+           << ",\"tail_first_col0\":" << first << "}";
+    }
+    os << "]";
+    return os.str();
+}
+
+void dumpCudaGraphReplayDebug(const PyModelInputs& inputs,
+                              const CudaGraphState& state,
+                              int32_t               full_group_id,
+                              bool                  has_hybrid_cache) {
+    static std::atomic<uint64_t> seq{0};
+    static std::mutex            mutex;
+
+    if (!envFlagEnabled("RTPLLM_CUDA_GRAPH_REPLAY_DEBUG")) {
+        return;
+    }
+    const uint64_t current_seq = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t  every       = std::max<int64_t>(1, envIntValue("RTPLLM_CUDA_GRAPH_REPLAY_DEBUG_EVERY", 1));
+    if (current_seq % static_cast<uint64_t>(every) != 0) {
+        return;
+    }
+
+    const auto&  attn       = inputs.attention_inputs;
+    const int64_t graph_bs   = attn.input_lengths.defined() ? attn.input_lengths.size(0) : state.current_real_graph_bs;
+    const int64_t current_bs = state.current_batch_size;
+    if (current_bs >= graph_bs) {
+        return;
+    }
+
+    const bool sync_device = envFlagEnabled("RTPLLM_CUDA_GRAPH_REPLAY_DEBUG_SYNC_DEVICE");
+    const auto dir         = envStringValue("RTPLLM_CUDA_GRAPH_REPLAY_DEBUG_DIR", "/tmp/rtp_llm_cuda_graph_debug");
+    mkdir(dir.c_str(), 0755);
+    std::ostringstream path;
+    path << dir << "/cuda_graph_replay_rank" << envStringValue("RANK", "0") << "_pid" << getpid() << ".jsonl";
+
+    std::ostringstream line;
+    line << "{\"seq\":" << current_seq << ",\"pid\":" << getpid() << ",\"rank\":\"" << envStringValue("RANK", "0")
+         << "\",\"current_bs\":" << current_bs << ",\"graph_bs\":" << graph_bs
+         << ",\"current_real_graph_bs\":" << state.current_real_graph_bs
+         << ",\"full_kv_cache_group_id\":" << full_group_id << ",\"has_hybrid_cache\":"
+         << (has_hybrid_cache ? "true" : "false")
+         << ",\"input_lengths_tail_nonzero\":" << countHostI32NonZero(attn.input_lengths, current_bs, graph_bs)
+         << ",\"sequence_lengths_tail_nonzero\":" << countHostI32NonZero(attn.sequence_lengths, current_bs, graph_bs)
+         << ",\"decode_cu_tail_not_current_bs\":"
+         << countHostI32NotEqual(attn.decode_cu_seqlens_host,
+                                 current_bs + 1,
+                                 graph_bs + 1,
+                                 static_cast<int32_t>(current_bs))
+         << ",\"device_input_lengths_tail_nonzero\":"
+         << countDeviceI32NonZeroIfEnabled(attn.input_lengths_d, current_bs, graph_bs, sync_device)
+         << ",\"device_sequence_lengths_tail_nonzero\":"
+         << countDeviceI32NonZeroIfEnabled(attn.sequence_lengths_plus_1_d, current_bs, graph_bs, sync_device)
+         << ",\"layer_to_group_prefix\":" << hostI32PrefixJson(attn.kv_cache_layer_to_group, 32)
+         << ",\"hybrid_group_tail\":" << hybridGroupTailJson(attn, current_bs, graph_bs, full_group_id) << "}";
+
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ofstream               out(path.str(), std::ios::app);
+    out << line.str() << "\n";
+}
+
+}  // namespace
 
 // clang-format off
 // CUDA Graph Mode Configuration Table:
@@ -327,6 +512,7 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
                                      current_bs + 1,
                                      graph_bs + 1);
         }
+        dumpCudaGraphReplayDebug(py_model_inputs_, state, full_kv_cache_group_id_, has_hybrid_cache);
     } else {
         optimizedCopyAsync(inputs.attention_inputs.padding_offset,
                            py_model_inputs_.attention_inputs.padding_offset,
